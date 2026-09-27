@@ -97,3 +97,12 @@ account in Navigator and choose "Register a Virtual Server".
   separately.
 - **Trading hours:** orders fail on weekends and when the market is closed,
   and the Experts log shows why.
+
+## Variant without a daily loss limit
+
+`SmaCrossEA_NoDailyLimit.mq5` is the same bot with the daily loss limit
+removed completely. It keeps trading however much it loses in a day. Each
+trade still has its stop loss and % risk sizing, and the real-account lock
+stays. Its defaults match a BTCUSDm demo setup (M1, spread limit 2000 points,
+magic 20260928), so attaching it fresh doesn't block BTC trades.
+Install and compile it like the main EA.
