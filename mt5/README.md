@@ -80,7 +80,7 @@ account in Navigator and choose "Register a Virtual Server".
 | `InpAtrPeriod` | 14 | ATR period |
 | `InpStopAtrMult` | 2.0 | Stop loss distance = ATR × this |
 | `InpTakeProfitAtrMult` | 3.0 | Take profit distance = ATR × this (0 = none) |
-| `InpMaxDailyLossPct` | 3.0 | Daily equity drop that closes positions and stops trading |
+| `InpMaxDailyLossPct` | 3.0 | Daily equity drop that closes positions and stops trading (0 = off; takes effect immediately, even after a halt) |
 | `InpMaxSpreadPoints` | 50 | Skip entries when the spread is wider (0 = no limit) |
 | `InpAllowRealAccount` | false | Must be true to run on a real account |
 | `InpPushAlerts` | true | Send push notifications |

@@ -7,7 +7,7 @@
 //|  strategy. Leveraged CFDs can lose money very quickly.           |
 //+------------------------------------------------------------------+
 #property copyright "thaitrader"
-#property version   "1.01"
+#property version   "1.02"
 #property description "SMA crossover with ATR stop-loss/take-profit, % risk sizing and a daily loss limit."
 #property description "Refuses to run on a real account unless InpAllowRealAccount = true."
 
@@ -107,6 +107,13 @@ bool UpdateDailyState()
       GlobalVariableSet(GvName("equity"), equity);
       GlobalVariableSet(GvName("halted"), 0);
       PrintFormat("New trading day %s, start equity %.2f", TimeToString(today, TIME_DATE), equity);
+   }
+
+   // Limit switched off: ignore (and clear) any halt saved earlier today.
+   if(InpMaxDailyLossPct <= 0)
+   {
+      GlobalVariableSet(GvName("halted"), 0);
+      return false;
    }
 
    if(GlobalVariableGet(GvName("halted")) > 0)
