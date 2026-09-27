@@ -7,7 +7,7 @@
 //|  strategy. Leveraged CFDs can lose money very quickly.           |
 //+------------------------------------------------------------------+
 #property copyright "thaitrader"
-#property version   "1.00"
+#property version   "1.01"
 #property description "SMA crossover with ATR stop-loss/take-profit, % risk sizing and a daily loss limit."
 #property description "Refuses to run on a real account unless InpAllowRealAccount = true."
 
@@ -275,6 +275,49 @@ void OnDeinit(const int reason)
    IndicatorRelease(hSlow);
    IndicatorRelease(hAtr);
    Comment("");
+}
+
+//--- True if the position was opened by this EA on this symbol (checks its opening deal).
+bool PositionWasOurs(const long positionId)
+{
+   if(!HistorySelectByPosition(positionId))
+      return false;
+   for(int i = 0; i < HistoryDealsTotal(); i++)
+   {
+      ulong deal = HistoryDealGetTicket(i);
+      if(HistoryDealGetInteger(deal, DEAL_ENTRY) == DEAL_ENTRY_IN)
+         return HistoryDealGetString(deal, DEAL_SYMBOL) == _Symbol &&
+                (ulong)HistoryDealGetInteger(deal, DEAL_MAGIC) == InpMagic;
+   }
+   return false;
+}
+
+//--- Report closes done by the broker (stop loss, take profit, stop out).
+//--- Closes done by the EA itself are already reported in CloseAll().
+void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+{
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD || !HistoryDealSelect(trans.deal))
+      return;
+
+   ENUM_DEAL_ENTRY  entry  = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(trans.deal, DEAL_REASON);
+   if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY)
+      return;
+   if(reason != DEAL_REASON_SL && reason != DEAL_REASON_TP && reason != DEAL_REASON_SO)
+      return;
+
+   double price  = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+   double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT) +
+                   HistoryDealGetDouble(trans.deal, DEAL_SWAP) +
+                   HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+   long   posId  = HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+   if(!PositionWasOurs(posId))
+      return;
+
+   string what = reason == DEAL_REASON_SL ? "STOP LOSS" : reason == DEAL_REASON_TP ? "TAKE PROFIT" : "STOP OUT";
+   Notify(StringFormat("%s hit, closed @ %s, P/L %.2f %s", what, DoubleToString(price, _Digits), profit,
+                       AccountInfoString(ACCOUNT_CURRENCY)));
 }
 
 void OnTick()

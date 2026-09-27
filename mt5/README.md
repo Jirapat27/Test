@@ -65,8 +65,9 @@ account in Navigator and choose "Register a Virtual Server".
    **MetaQuotes ID**.
 2. In MT5 desktop, go to **Tools → Options → Notifications**. Tick
    **Enable Push Notifications**, paste the ID, and click **Test**.
-3. The EA now messages your phone when it starts, opens or closes a trade, an
-   order fails, or the daily loss limit is hit.
+3. The EA now messages your phone when it starts, opens or closes a trade, a
+   stop loss or take profit is hit, an order fails, or the daily loss limit
+   is hit.
 
 ## Inputs
 
