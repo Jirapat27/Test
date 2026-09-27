@@ -529,8 +529,8 @@ void OpenPosition(const ENUM_ORDER_TYPE type, const double atr)
       return;
    }
 
-   bool sent = isBuy ? trade.Buy(lots, _Symbol, price, sl, tp, "BtcAdaptive")
-                     : trade.Sell(lots, _Symbol, price, sl, tp, "BtcAdaptive");
+   bool sent = isBuy ? trade.Buy(lots, _Symbol, price, sl, tp, "BtcTrend")
+                     : trade.Sell(lots, _Symbol, price, sl, tp, "BtcTrend");
    uint rc = trade.ResultRetcode();
    if(sent && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED))
       Notify(StringFormat("%s %.2f lots @ %s, SL %s, TP %s [%s]", isBuy ? "BUY" : "SELL", lots,
