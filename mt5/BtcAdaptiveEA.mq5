@@ -1,22 +1,25 @@
 //+------------------------------------------------------------------+
 //|                                                BtcAdaptiveEA.mq5 |
-//|  BTC-only moving-average crossover bot that re-tunes itself.     |
+//|  BTC-only multi-strategy bot that re-tunes itself.               |
 //|                                                                  |
-//|  Every few hours it backtests a grid of settings (timeframe,     |
-//|  SMA periods, stop and target size) on recent BTC prices,        |
-//|  including the current spread. It picks the best setting on the  |
-//|  older part of the data, checks it on the most recent part it    |
-//|  did not tune on, and only switches when the new setting is      |
-//|  clearly better. When nothing is profitable after costs it stops |
-//|  opening trades until the next re-tune.                          |
+//|  Every few hours it backtests three kinds of strategy on recent  |
+//|  BTC prices, including the current spread:                       |
+//|    TREND    moving-average crossover                             |
+//|    MEANREV  Bollinger Band + RSI stretch, exit back at the mean  |
+//|    BREAKOUT close beyond the recent high/low range (Donchian)    |
+//|  across timeframes, periods, stop and target sizes. It picks the |
+//|  best on the older part of the data, requires it to also be      |
+//|  profitable on the most recent part it did not tune on, and      |
+//|  switches only when clearly better. When nothing clears the bar  |
+//|  it stops opening trades until the next re-tune.                 |
 //|                                                                  |
 //|  For learning on a DEMO account -- adaptation does not guarantee |
 //|  profits. There is NO daily loss limit in this bot.              |
 //+------------------------------------------------------------------+
 #property copyright "thaitrader"
-#property version   "1.00"
-#property description "BTC-only SMA crossover that re-tunes itself on recent data (incl. spread),"
-#property description "validates on unseen data, switches only when clearly better, pauses when nothing works."
+#property version   "2.00"
+#property description "BTC-only bot that re-tunes itself across TREND, MEAN-REVERSION and BREAKOUT strategies"
+#property description "on recent data (incl. spread), validates on unseen data, pauses when nothing works."
 #property description "Per-trade stop loss and % risk sizing. No daily loss limit. Demo-only unless allowed."
 
 #include <Trade\Trade.mqh>
@@ -26,8 +29,12 @@ input int    InpRetuneHours     = 6;     // Re-tune every N hours
 input int    InpLookbackDays    = 7;     // Days of recent history used for tuning
 input double InpValidationShare = 0.33;  // Most recent share of the lookback kept for validation (0.1-0.5)
 input int    InpMinTrades       = 15;    // Minimum trades in the tuning part for a setting to count
+input double InpMinPF           = 1.2;   // Minimum profit factor in BOTH tuning and validation
 input double InpSwitchMarginR   = 1.0;   // New setting must beat the current one by this many R (validation)
-input bool   InpPauseIfNoEdge   = true;  // Stop opening trades when no setting is profitable after costs
+input bool   InpPauseIfNoEdge   = true;  // Stop opening trades when no setting clears the bar
+input bool   InpUseTrend        = true;  // Strategy: TREND (moving-average crossover)
+input bool   InpUseMeanRev      = true;  // Strategy: MEAN REVERSION (Bollinger Bands + RSI)
+input bool   InpUseBreakout     = true;  // Strategy: BREAKOUT (recent high/low range)
 input bool   InpUseM1           = true;  // Candidate timeframe: M1
 input bool   InpUseM5           = true;  // Candidate timeframe: M5
 input bool   InpUseM15          = true;  // Candidate timeframe: M15
@@ -35,6 +42,7 @@ input bool   InpUseM15          = true;  // Candidate timeframe: M15
 input group "Risk"
 input double InpRiskPercent     = 1.0;   // % of balance lost if the stop loss is hit
 input int    InpAtrPeriod       = 14;    // ATR period for stop/target distance
+input int    InpRsiPeriod       = 14;    // RSI period (mean reversion)
 input int    InpMaxSpreadPoints = 2000;  // Skip entries when spread is wider, in points (0 = no limit)
 input bool   InpAllowShort      = true;  // Also trade short (sell) signals
 
@@ -43,17 +51,27 @@ input bool   InpAllowRealAccount = false;    // Allow trading on a REAL account
 input bool   InpPushAlerts       = true;     // Send push notifications to the MT5 phone app
 input ulong  InpMagic            = 20260929; // Magic number (identifies this EA's positions)
 
-//--- Candidate grid
-int    FastList[] = {5, 8, 10, 12, 20};
-int    SlowList[] = {20, 21, 30, 48, 60};
-double SlList[]   = {1.5, 2.0, 3.0};      // stop loss = ATR x this
-double TpList[]   = {0.0, 2.0, 3.0};      // take profit = ATR x this (0 = exit on opposite cross only)
+#define STRAT_TREND    0
+#define STRAT_MEANREV  1
+#define STRAT_BREAKOUT 2
+
+//--- Candidate grids
+int    FastList[]   = {5, 8, 10, 12, 20};   // TREND fast SMA
+int    SlowList[]   = {20, 21, 30, 48, 60}; // TREND slow SMA
+int    BandList[]   = {20, 30};             // MEANREV Bollinger/SMA period
+double BandKList[]  = {2.0, 2.5};           // MEANREV band width in standard deviations
+int    RsiLowList[] = {30, 25};             // MEANREV RSI oversold level (overbought = 100 - this)
+int    RangeList[]  = {20, 40, 60};         // BREAKOUT range length in bars
+double SlList[]     = {1.5, 2.0, 3.0};      // stop loss = ATR x this
+double TpList[]     = {0.0, 2.0, 3.0};      // take profit = ATR x this (0 = exit on the strategy's exit signal)
 
 struct Config
 {
+   int             strat;
    ENUM_TIMEFRAMES tf;
-   int             fast;
-   int             slow;
+   int             p1;      // TREND fast | MEANREV period | BREAKOUT range
+   int             p2;      // TREND slow | MEANREV RSI low level
+   double          p3;      // MEANREV band width
    double          slMult;
    double          tpMult;
 };
@@ -76,8 +94,16 @@ datetime  lastRetune   = 0;
 SimResult curIS, curOOS;
 string    lastRetuneNote = "not tuned yet";
 
+//--- Search state used during Retune()
+bool      s_found, s_curEvaluated;
+Config    s_best;
+SimResult s_bestIS, s_bestOOS, s_curIS, s_curOOS;
+int       s_tested;
+
 //--- Price series of one timeframe (closed bars, oldest first) + prefix sums
-double g_open[], g_high[], g_low[], g_close[], g_cumClose[], g_cumTR[];
+double g_open[], g_high[], g_low[], g_close[];
+double g_cumClose[], g_cumTR[], g_cumDev[], g_cumDev2[], g_cumGain[], g_cumLoss[];
+double g_base = 0;   // closes are shifted by this before squaring (keeps variance accurate)
 int    g_n = 0;
 
 //+------------------------------------------------------------------+
@@ -96,8 +122,15 @@ string TfName(const ENUM_TIMEFRAMES tf)
 
 string ConfigText(const Config &c)
 {
-   return StringFormat("%s SMA %d/%d SL %.1fxATR TP %s", TfName(c.tf), c.fast, c.slow, c.slMult,
-                       c.tpMult > 0 ? StringFormat("%.1fxATR", c.tpMult) : "on cross");
+   string tp = c.tpMult > 0 ? StringFormat("%.1fxATR", c.tpMult) : "on exit signal";
+   string core;
+   if(c.strat == STRAT_TREND)
+      core = StringFormat("TREND SMA %d/%d", c.p1, c.p2);
+   else if(c.strat == STRAT_MEANREV)
+      core = StringFormat("MEANREV BB %d x%.1f RSI %d/%d", c.p1, c.p3, c.p2, 100 - c.p2);
+   else
+      core = StringFormat("BREAKOUT %d bars", c.p1);
+   return StringFormat("%s %s SL %.1fxATR TP %s", TfName(c.tf), core, c.slMult, tp);
 }
 
 double ProfitFactor(const SimResult &r)
@@ -135,15 +168,24 @@ bool LoadSeries(const ENUM_TIMEFRAMES tf, const int bars, const int minBars)
    if(got < minBars)
       return false;
 
-   g_n = got;
+   g_n    = got;
+   g_base = r[0].close;
    ArrayResize(g_open, got);
    ArrayResize(g_high, got);
    ArrayResize(g_low, got);
    ArrayResize(g_close, got);
    ArrayResize(g_cumClose, got + 1);
    ArrayResize(g_cumTR, got + 1);
+   ArrayResize(g_cumDev, got + 1);
+   ArrayResize(g_cumDev2, got + 1);
+   ArrayResize(g_cumGain, got + 1);
+   ArrayResize(g_cumLoss, got + 1);
    g_cumClose[0] = 0;
    g_cumTR[0]    = 0;
+   g_cumDev[0]   = 0;
+   g_cumDev2[0]  = 0;
+   g_cumGain[0]  = 0;
+   g_cumLoss[0]  = 0;
    for(int i = 0; i < got; i++)
    {
       g_open[i]  = r[i].open;
@@ -151,10 +193,19 @@ bool LoadSeries(const ENUM_TIMEFRAMES tf, const int bars, const int minBars)
       g_low[i]   = r[i].low;
       g_close[i] = r[i].close;
       double tr = r[i].high - r[i].low;
+      double change = 0;
       if(i > 0)
+      {
          tr = MathMax(tr, MathMax(MathAbs(r[i].high - r[i - 1].close), MathAbs(r[i].low - r[i - 1].close)));
+         change = r[i].close - r[i - 1].close;
+      }
+      double dev = r[i].close - g_base;
       g_cumClose[i + 1] = g_cumClose[i] + r[i].close;
       g_cumTR[i + 1]    = g_cumTR[i] + tr;
+      g_cumDev[i + 1]   = g_cumDev[i] + dev;
+      g_cumDev2[i + 1]  = g_cumDev2[i] + dev * dev;
+      g_cumGain[i + 1]  = g_cumGain[i] + (change > 0 ? change : 0);
+      g_cumLoss[i + 1]  = g_cumLoss[i] + (change < 0 ? -change : 0);
    }
    return true;
 }
@@ -165,13 +216,32 @@ double SmaAt(const int i, const int p)
    return (g_cumClose[i + 1] - g_cumClose[i + 1 - p]) / p;
 }
 
+// Population standard deviation of close[i-p+1 .. i]
+double StdAt(const int i, const int p)
+{
+   double m  = (g_cumDev[i + 1] - g_cumDev[i + 1 - p]) / p;
+   double m2 = (g_cumDev2[i + 1] - g_cumDev2[i + 1 - p]) / p;
+   double v  = m2 - m * m;
+   return v > 0 ? MathSqrt(v) : 0;
+}
+
 // Simple average true range over bars i-p+1 .. i
 double AtrAt(const int i, const int p)
 {
    return (g_cumTR[i + 1] - g_cumTR[i + 1 - p]) / p;
 }
 
-// +1 = fast crossed above slow at the close of bar i, -1 = crossed below, 0 = no cross. Needs i >= slow.
+// RSI (simple-average form) over the last p price changes ending at bar i
+double RsiAt(const int i, const int p)
+{
+   double gain = g_cumGain[i + 1] - g_cumGain[i + 1 - p];
+   double loss = g_cumLoss[i + 1] - g_cumLoss[i + 1 - p];
+   if(gain + loss <= 0)
+      return 50.0;
+   return 100.0 * gain / (gain + loss);
+}
+
+// +1 = fast crossed above slow at the close of bar i, -1 = crossed below, 0 = no cross
 int CrossAt(const int i, const int fast, const int slow)
 {
    double d0 = SmaAt(i - 1, fast) - SmaAt(i - 1, slow);
@@ -183,49 +253,105 @@ int CrossAt(const int i, const int fast, const int slow)
    return 0;
 }
 
+// Bars needed before a setting can produce signals
+int Warmup(const Config &c)
+{
+   int w = InpAtrPeriod;
+   if(c.strat == STRAT_TREND)
+      w = MathMax(w, c.p2);
+   else if(c.strat == STRAT_MEANREV)
+      w = MathMax(w, MathMax(c.p1, InpRsiPeriod));
+   else
+      w = MathMax(w, c.p1);
+   return w + 1;
+}
+
+// Entry signal at the close of bar i: +1 buy, -1 sell, 0 nothing. Needs i >= Warmup(c).
+int EntrySignal(const int i, const Config &c)
+{
+   if(c.strat == STRAT_TREND)
+      return CrossAt(i, c.p1, c.p2);
+
+   if(c.strat == STRAT_MEANREV)
+   {
+      double mid  = SmaAt(i, c.p1);
+      double band = c.p3 * StdAt(i, c.p1);
+      double rsi  = RsiAt(i, InpRsiPeriod);
+      if(g_close[i] < mid - band && rsi < c.p2)
+         return 1;
+      if(g_close[i] > mid + band && rsi > 100 - c.p2)
+         return -1;
+      return 0;
+   }
+
+   // BREAKOUT: close beyond the highest high / lowest low of the previous p1 bars
+   double hi = g_high[i - 1], lo = g_low[i - 1];
+   for(int k = i - c.p1; k < i - 1; k++)
+   {
+      if(g_high[k] > hi)
+         hi = g_high[k];
+      if(g_low[k] < lo)
+         lo = g_low[k];
+   }
+   if(g_close[i] > hi)
+      return 1;
+   if(g_close[i] < lo)
+      return -1;
+   return 0;
+}
+
+// Strategy-specific exit at the close of bar i for a position in direction pos (+1/-1).
+// TREND and BREAKOUT exit on the opposite entry signal (handled by the caller);
+// MEANREV also exits once the price is back at its average.
+bool ExitSignal(const int i, const Config &c, const int pos)
+{
+   if(c.strat != STRAT_MEANREV)
+      return false;
+   double mid = SmaAt(i, c.p1);
+   return pos > 0 ? g_close[i] >= mid : g_close[i] <= mid;
+}
+
 //+------------------------------------------------------------------+
-//| Backtest one setting on bars [from, to) of the loaded series.    |
-//| Same rules as live: decide on a bar's close, enter at the next   |
-//| open, SL/TP from ATR, exit on opposite cross. Buys pay the       |
-//| spread on entry, sells pay it on exit. If SL and TP are both     |
-//| touched in one bar, the stop is assumed to hit first.            |
+//| Backtest one setting on bars [iFrom, iTo) of the loaded series.  |
+//| Same rules as live: decide on a bar's close, act at the next     |
+//| open, SL/TP from ATR. Buys pay the spread on entry, sells on     |
+//| exit. If SL and TP are both touched in one bar, the stop is      |
+//| assumed to hit first.                                            |
 //+------------------------------------------------------------------+
 void Simulate(const Config &c, const int iFrom, const int iTo, const double spread, SimResult &res)
 {
    ResetResult(res);
    int    pos = 0;
    double entry = 0, sl = 0, tp = 0, risk = 0;
-   int    start = MathMax(iFrom, MathMax(c.slow, InpAtrPeriod) + 1);
+   int    start = MathMax(iFrom, Warmup(c));
 
    for(int i = start; i < iTo; i++)
    {
       // 1) Manage the open position during bar i
       if(pos > 0)
       {
-         if(g_low[i] <= sl)                     { Book(res, (sl - entry) / risk); pos = 0; }
-         else if(tp > 0 && g_high[i] >= tp)     { Book(res, (tp - entry) / risk); pos = 0; }
+         if(g_low[i] <= sl)                          { Book(res, (sl - entry) / risk); pos = 0; }
+         else if(tp > 0 && g_high[i] >= tp)          { Book(res, (tp - entry) / risk); pos = 0; }
       }
       else if(pos < 0)
       {
-         if(g_high[i] + spread >= sl)           { Book(res, (entry - sl) / risk); pos = 0; }
-         else if(tp > 0 && g_low[i] + spread <= tp) { Book(res, (entry - tp) / risk); pos = 0; }
+         if(g_high[i] + spread >= sl)                { Book(res, (entry - sl) / risk); pos = 0; }
+         else if(tp > 0 && g_low[i] + spread <= tp)  { Book(res, (entry - tp) / risk); pos = 0; }
       }
 
-      // 2) Signal at the close of bar i -> act at the open of bar i+1
+      // 2) Signals at the close of bar i -> act at the open of bar i+1
       if(i + 1 >= iTo)
          break;
-      int x = CrossAt(i, c.fast, c.slow);
-      if(x == 0)
-         continue;
       double nextOpen = g_open[i + 1];
+      int    x = EntrySignal(i, c);
 
-      if(pos != 0 && x != pos)
+      if(pos != 0 && (ExitSignal(i, c, pos) || (x != 0 && x != pos)))
       {
          double exitPx = pos > 0 ? nextOpen : nextOpen + spread;
          Book(res, pos > 0 ? (exitPx - entry) / risk : (entry - exitPx) / risk);
          pos = 0;
       }
-      if(pos == 0 && (x > 0 || InpAllowShort))
+      if(pos == 0 && x != 0 && (x > 0 || InpAllowShort))
       {
          double atr = AtrAt(i, InpAtrPeriod);
          if(atr <= 0)
@@ -256,12 +382,52 @@ void Simulate(const Config &c, const int iFrom, const int iTo, const double spre
 
 bool SameConfig(const Config &a, const Config &b)
 {
-   return a.tf == b.tf && a.fast == b.fast && a.slow == b.slow &&
-          MathAbs(a.slMult - b.slMult) < 1e-9 && MathAbs(a.tpMult - b.tpMult) < 1e-9;
+   return a.strat == b.strat && a.tf == b.tf && a.p1 == b.p1 && a.p2 == b.p2 &&
+          MathAbs(a.p3 - b.p3) < 1e-9 && MathAbs(a.slMult - b.slMult) < 1e-9 &&
+          MathAbs(a.tpMult - b.tpMult) < 1e-9;
+}
+
+bool Passes(const SimResult &r, const int minTrades)
+{
+   return r.trades >= minTrades && r.totalR > 0 && ProfitFactor(r) >= InpMinPF;
+}
+
+// Evaluate one candidate on the loaded series and update the search state.
+void Consider(const Config &c, const int split, const double spread)
+{
+   s_tested++;
+   SimResult rIs, rOos;
+   ZeroMemory(rIs);
+   ZeroMemory(rOos);
+   Simulate(c, 0, split, spread, rIs);
+
+   bool isCurrent = haveConfig && SameConfig(c, cur);
+   if(isCurrent)
+   {
+      Simulate(c, split, g_n, spread, rOos);
+      s_curIS = rIs;
+      s_curOOS = rOos;
+      s_curEvaluated = true;
+   }
+   // Must clear the bar on the tuning part...
+   if(!Passes(rIs, InpMinTrades))
+      return;
+   if(!isCurrent)
+      Simulate(c, split, g_n, spread, rOos);
+   // ...and on the recent part it was not tuned on.
+   if(!Passes(rOos, MathMax(3, InpMinTrades / 3)))
+      return;
+   if(!s_found || rIs.totalR > s_bestIS.totalR)
+   {
+      s_best = c;
+      s_bestIS = rIs;
+      s_bestOOS = rOos;
+      s_found = true;
+   }
 }
 
 //+------------------------------------------------------------------+
-//| Re-tune: search the grid, validate, decide whether to switch.    |
+//| Re-tune: search all strategies, validate, decide.                |
 //| Returns false when no price history could be loaded.             |
 //+------------------------------------------------------------------+
 bool Retune()
@@ -273,17 +439,16 @@ bool Retune()
    if(InpUseM15) { ArrayResize(tfs, ntf + 1); tfs[ntf++] = PERIOD_M15; }
 
    double spread = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * _Point;
-   int    minOOS = MathMax(3, InpMinTrades / 3);
 
-   bool      loadedAny = false, found = false, curEvaluated = false;
-   Config    best;
-   SimResult bestIS, bestOOS, curOOSNow, curISNow;
-   ZeroMemory(best);
-   ResetResult(bestIS);
-   ResetResult(bestOOS);
-   ResetResult(curOOSNow);
-   ResetResult(curISNow);
-   int tested = 0;
+   s_found = false;
+   s_curEvaluated = false;
+   s_tested = 0;
+   ZeroMemory(s_best);
+   ResetResult(s_bestIS);
+   ResetResult(s_bestOOS);
+   ResetResult(s_curIS);
+   ResetResult(s_curOOS);
+   bool loadedAny = false;
 
    for(int t = 0; t < ntf; t++)
    {
@@ -291,56 +456,59 @@ bool Retune()
       int want       = InpLookbackDays * barsPerDay + 100;
       if(!LoadSeries(tfs[t], want, 300))
       {
-         PrintFormat("Re-tune: not enough %s history yet (%d error)", TfName(tfs[t]), GetLastError());
+         PrintFormat("Re-tune: not enough %s history yet (error %d)", TfName(tfs[t]), GetLastError());
          continue;
       }
       loadedAny = true;
       int split = (int)(g_n * (1.0 - InpValidationShare));
 
-      for(int a = 0; a < ArraySize(FastList); a++)
-         for(int b = 0; b < ArraySize(SlowList); b++)
+      Config c;
+      ZeroMemory(c);
+      c.tf = tfs[t];
+      for(int s = 0; s < ArraySize(SlList); s++)
+         for(int k = 0; k < ArraySize(TpList); k++)
          {
-            if(FastList[a] >= SlowList[b])
-               continue;
-            for(int s = 0; s < ArraySize(SlList); s++)
-               for(int k = 0; k < ArraySize(TpList); k++)
-               {
-                  Config c;
-                  c.tf = tfs[t];
-                  c.fast = FastList[a];
-                  c.slow = SlowList[b];
-                  c.slMult = SlList[s];
-                  c.tpMult = TpList[k];
-                  tested++;
+            c.slMult = SlList[s];
+            c.tpMult = TpList[k];
 
-                  SimResult rIs, rOos;
-                  ZeroMemory(rIs);
-                  ZeroMemory(rOos);
-                  Simulate(c, 0, split, spread, rIs);
-                  bool isCurrent = haveConfig && SameConfig(c, cur);
-                  if(isCurrent)
+            if(InpUseTrend)
+            {
+               c.strat = STRAT_TREND;
+               c.p3 = 0;
+               for(int a = 0; a < ArraySize(FastList); a++)
+                  for(int b = 0; b < ArraySize(SlowList); b++)
                   {
-                     Simulate(c, split, g_n, spread, rOos);
-                     curISNow = rIs;
-                     curOOSNow = rOos;
-                     curEvaluated = true;
+                     if(FastList[a] >= SlowList[b])
+                        continue;
+                     c.p1 = FastList[a];
+                     c.p2 = SlowList[b];
+                     Consider(c, split, spread);
                   }
-                  // Must be profitable, with enough trades, on the tuning part...
-                  if(rIs.trades < InpMinTrades || rIs.totalR <= 0 || ProfitFactor(rIs) <= 1.0)
-                     continue;
-                  if(!isCurrent)
-                     Simulate(c, split, g_n, spread, rOos);
-                  // ...and still profitable on the recent part it was not tuned on.
-                  if(rOos.trades < minOOS || rOos.totalR <= 0 || ProfitFactor(rOos) <= 1.0)
-                     continue;
-                  if(!found || rIs.totalR > bestIS.totalR)
-                  {
-                     best = c;
-                     bestIS = rIs;
-                     bestOOS = rOos;
-                     found = true;
-                  }
+            }
+            if(InpUseMeanRev)
+            {
+               c.strat = STRAT_MEANREV;
+               for(int a = 0; a < ArraySize(BandList); a++)
+                  for(int b = 0; b < ArraySize(BandKList); b++)
+                     for(int d = 0; d < ArraySize(RsiLowList); d++)
+                     {
+                        c.p1 = BandList[a];
+                        c.p3 = BandKList[b];
+                        c.p2 = RsiLowList[d];
+                        Consider(c, split, spread);
+                     }
+            }
+            if(InpUseBreakout)
+            {
+               c.strat = STRAT_BREAKOUT;
+               c.p2 = 0;
+               c.p3 = 0;
+               for(int a = 0; a < ArraySize(RangeList); a++)
+               {
+                  c.p1 = RangeList[a];
+                  Consider(c, split, spread);
                }
+            }
          }
    }
 
@@ -348,15 +516,15 @@ bool Retune()
       return false;
 
    lastRetune = TimeCurrent();
-   if(curEvaluated)
+   if(s_curEvaluated)
    {
-      curIS = curISNow;
-      curOOS = curOOSNow;
+      curIS = s_curIS;
+      curOOS = s_curOOS;
    }
 
-   if(!found)
+   if(!s_found)
    {
-      lastRetuneNote = StringFormat("%d settings tested, none profitable after costs", tested);
+      lastRetuneNote = StringFormat("%d settings tested, none with PF >= %.2f after costs", s_tested, InpMinPF);
       if(InpPauseIfNoEdge && !paused)
          Notify(lastRetuneNote + " -> PAUSED new trades until the next re-tune");
       else
@@ -369,39 +537,40 @@ bool Retune()
    paused = false;
 
    bool switchIt = !haveConfig || wasPaused;
-   if(!switchIt && !SameConfig(best, cur))
+   if(!switchIt && !SameConfig(s_best, cur))
    {
-      // Switch if the current setting now loses on recent data, or the new one is clearly better.
-      if(!curEvaluated || curOOS.totalR <= 0 || bestOOS.totalR >= curOOS.totalR + InpSwitchMarginR)
+      // Switch if the current setting no longer clears the bar, or the new one is clearly better.
+      if(!s_curEvaluated || !Passes(curOOS, MathMax(3, InpMinTrades / 3)) ||
+         s_bestOOS.totalR >= curOOS.totalR + InpSwitchMarginR)
          switchIt = true;
    }
 
-   if(switchIt && !SameConfig(best, cur))
+   if(switchIt && !SameConfig(s_best, cur))
    {
       string prevText = haveConfig ? ConfigText(cur) : "none";
-      cur = best;
+      cur = s_best;
       haveConfig = true;
-      curIS = bestIS;
-      curOOS = bestOOS;
-      lastBarTime = iTime(_Symbol, cur.tf, 0); // act only on crosses after the switch
-      lastRetuneNote = StringFormat("switched to %s", ConfigText(cur));
+      curIS = s_bestIS;
+      curOOS = s_bestOOS;
+      lastBarTime = iTime(_Symbol, cur.tf, 0); // act only on signals after the switch
+      lastRetuneNote = "switched to " + ConfigText(cur);
       Notify(StringFormat("Re-tuned (%d settings): %s -> %s | tuning %+.1fR %d trades PF %.2f | validation %+.1fR %d trades PF %.2f",
-                          tested, prevText, ConfigText(cur), curIS.totalR, curIS.trades, ProfitFactor(curIS),
+                          s_tested, prevText, ConfigText(cur), curIS.totalR, curIS.trades, ProfitFactor(curIS),
                           curOOS.totalR, curOOS.trades, ProfitFactor(curOOS)));
    }
    else
    {
-      if(switchIt) // was paused, best == current: resume
+      if(switchIt) // was paused and the best is the current setting: resume
       {
-         curIS = bestIS;
-         curOOS = bestOOS;
+         curIS = s_bestIS;
+         curOOS = s_bestOOS;
       }
-      lastRetuneNote = StringFormat("kept %s", ConfigText(cur));
+      lastRetuneNote = "kept " + ConfigText(cur);
       if(wasPaused)
          Notify("Re-tuned: edge found again, RESUMED with " + ConfigText(cur));
       else
          PrintFormat("Re-tuned (%d settings): keeping %s (validation %+.1fR, best alternative %+.1fR)",
-                     tested, ConfigText(cur), curOOS.totalR, bestOOS.totalR);
+                     s_tested, ConfigText(cur), curOOS.totalR, s_bestOOS.totalR);
    }
    return true;
 }
@@ -428,7 +597,7 @@ int CountPositions(const ENUM_POSITION_TYPE type)
    return n;
 }
 
-void CloseAll(const ENUM_POSITION_TYPE type)
+void CloseAll(const ENUM_POSITION_TYPE type, const string why)
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -437,8 +606,8 @@ void CloseAll(const ENUM_POSITION_TYPE type)
          continue;
       double profit = PositionGetDouble(POSITION_PROFIT);
       if(trade.PositionClose(ticket))
-         Notify(StringFormat("closed %s #%I64u on opposite cross, P/L %.2f %s",
-                             type == POSITION_TYPE_BUY ? "BUY" : "SELL", ticket, profit,
+         Notify(StringFormat("closed %s #%I64u (%s), P/L %.2f %s",
+                             type == POSITION_TYPE_BUY ? "BUY" : "SELL", ticket, why, profit,
                              AccountInfoString(ACCOUNT_CURRENCY)));
       else
          PrintFormat("Close #%I64u failed: %u %s", ticket, trade.ResultRetcode(),
@@ -541,12 +710,13 @@ void OpenPosition(const ENUM_ORDER_TYPE type, const double atr)
 void ShowStatus()
 {
    string setting = haveConfig ? ConfigText(cur) : "none yet";
-   string state   = !haveConfig ? "waiting for first tune" : (paused ? "PAUSED (no edge after costs)" : "running");
-   Comment(StringFormat("BtcAdaptiveEA  %s  %s\nSetting: %s\nLast re-tune: %s (%s)\nTuning %+.1fR %d tr PF %.2f | Validation %+.1fR %d tr PF %.2f\nNext re-tune: %s\nBalance %.2f  Equity %.2f  Long %d  Short %d",
+   string state   = !haveConfig ? (paused ? "PAUSED (no edge after costs)" : "waiting for first tune")
+                                : (paused ? "PAUSED (no edge after costs)" : "running");
+   Comment(StringFormat("BtcAdaptiveEA 2.0  %s  %s\nSetting: %s\nLast re-tune: %s (%s)\nTuning %+.1fR %d tr PF %.2f | Validation %+.1fR %d tr PF %.2f | min PF %.2f\nNext re-tune: %s\nBalance %.2f  Equity %.2f  Long %d  Short %d",
                         _Symbol, state, setting,
                         lastRetune > 0 ? TimeToString(lastRetune, TIME_DATE | TIME_MINUTES) : "-", lastRetuneNote,
                         curIS.totalR, curIS.trades, ProfitFactor(curIS),
-                        curOOS.totalR, curOOS.trades, ProfitFactor(curOOS),
+                        curOOS.totalR, curOOS.trades, ProfitFactor(curOOS), InpMinPF,
                         nextRetune > 0 ? TimeToString(nextRetune, TIME_DATE | TIME_MINUTES) : "-",
                         AccountInfoDouble(ACCOUNT_BALANCE), AccountInfoDouble(ACCOUNT_EQUITY),
                         CountPositions(POSITION_TYPE_BUY), CountPositions(POSITION_TYPE_SELL)));
@@ -563,6 +733,11 @@ int OnInit()
    if(!InpUseM1 && !InpUseM5 && !InpUseM15)
    {
       Print("Enable at least one candidate timeframe");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(!InpUseTrend && !InpUseMeanRev && !InpUseBreakout)
+   {
+      Print("Enable at least one strategy");
       return INIT_PARAMETERS_INCORRECT;
    }
    if(InpValidationShare < 0.1 || InpValidationShare > 0.5 || InpLookbackDays < 1 || InpRetuneHours < 1)
@@ -592,10 +767,10 @@ int OnInit()
    paused     = false;
    nextRetune = 0; // first tune on the first tick, once history is available
 
-   Notify(StringFormat("started on %s account %I64d (%s), risk %.1f%%/trade, re-tune every %dh on %d days, NO daily loss limit",
+   Notify(StringFormat("v2.0 started on %s account %I64d (%s), risk %.1f%%/trade, re-tune every %dh on %d days, min PF %.2f, NO daily loss limit",
                        AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DEMO" : "REAL",
                        AccountInfoInteger(ACCOUNT_LOGIN), AccountInfoString(ACCOUNT_SERVER),
-                       InpRiskPercent, InpRetuneHours, InpLookbackDays));
+                       InpRiskPercent, InpRetuneHours, InpLookbackDays, InpMinPF));
    return INIT_SUCCEEDED;
 }
 
@@ -663,23 +838,22 @@ void OnTick()
    datetime barTime = iTime(_Symbol, cur.tf, 0);
    if(barTime == 0 || barTime == lastBarTime)
       return;
-   int need = MathMax(cur.slow, InpAtrPeriod) + 5;
-   if(!LoadSeries(cur.tf, need, cur.slow + 2))
+   int warm = Warmup(cur);
+   if(!LoadSeries(cur.tf, warm + 10, warm + 2))
       return; // data not ready yet; try again on the next tick
    lastBarTime = barTime;
 
    int i = g_n - 1; // last closed bar
-   int x = CrossAt(i, cur.fast, cur.slow);
-   if(x == 0)
-      return;
+   int x = EntrySignal(i, cur);
 
-   if(x > 0)
-      CloseAll(POSITION_TYPE_SELL);
-   else
-      CloseAll(POSITION_TYPE_BUY);
+   // Exits: strategy exit signal, or an entry signal in the opposite direction
+   if(CountPositions(POSITION_TYPE_BUY) > 0 && (ExitSignal(i, cur, 1) || x < 0))
+      CloseAll(POSITION_TYPE_BUY, x < 0 ? "opposite signal" : "back at the mean");
+   if(CountPositions(POSITION_TYPE_SELL) > 0 && (ExitSignal(i, cur, -1) || x > 0))
+      CloseAll(POSITION_TYPE_SELL, x > 0 ? "opposite signal" : "back at the mean");
 
-   if(paused)
-      return; // no edge right now: exits only, no new trades
+   if(paused || x == 0)
+      return; // no edge right now, or no entry signal
 
    double atr = AtrAt(i, InpAtrPeriod);
    if(x > 0 && CountPositions(POSITION_TYPE_BUY) == 0)
