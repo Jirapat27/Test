@@ -106,3 +106,36 @@ trade still has its stop loss and % risk sizing, and the real-account lock
 stays. Its defaults match a BTCUSDm demo setup (M1, spread limit 2000 points,
 magic 20260928), so attaching it fresh doesn't block BTC trades.
 Install and compile it like the main EA.
+
+## BtcAdaptiveEA: self-tuning bot for Bitcoin
+
+`BtcAdaptiveEA.mq5` re-tunes itself. It only runs on BTC symbols such as
+`BTCUSDm`.
+
+**How it adapts (every `InpRetuneHours`, default 6 hours):**
+1. It loads the last `InpLookbackDays` (default 7) of BTC prices on M1, M5 and
+   M15.
+2. It backtests 648 settings: timeframe × SMA periods (fast 5–20, slow 20–60) ×
+   stop (1.5/2/3 × ATR) × target (none/2/3 × ATR). Every simulated trade pays
+   the **current spread**. Results are in R, where 1R is the stop-loss distance
+   (the risk of one trade).
+3. It picks the best setting on the **older ~2/3** of the data (the tuning
+   part). The setting must also be profitable on the **most recent ~1/3**,
+   which it wasn't tuned on (the validation part).
+4. It switches only if the new setting beats the current one by
+   `InpSwitchMarginR` on validation, or if the current one has started losing.
+5. If **no setting is profitable after costs**, it **pauses new trades**
+   (`InpPauseIfNoEdge`). Open positions keep their stops. It checks again at
+   the next re-tune.
+
+Every switch, pause and resume is sent to the Experts tab and your iPhone. The
+chart shows the active setting and its tuning and validation scores.
+
+**Unchanged:** stop loss and take profit on every trade, sizing for about 1%
+risk, the spread filter (default 2000 points), margin check, SL/TP alerts, and
+the real-account lock. There is **no daily loss limit**. The default magic
+number is 20260929, so its trades stay separate from the other bots.
+
+**Backtest the adaptation itself** in the Strategy Tester (BTCUSDm, any chart
+timeframe, 1-minute OHLC). Use 1–3 months: each re-tune runs 648 mini
+backtests, so long tests are slow.
