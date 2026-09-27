@@ -148,3 +148,19 @@ lock. There is **no daily loss limit**. The default magic number is 20260929.
 **Backtest the adaptation itself** in the Strategy Tester (BTCUSDm,
 1-minute OHLC, 1–3 months). Each re-tune runs 945 mini backtests, so long
 tests are slow.
+
+## BtcAdaptiveTrendEA: trend-only self-tuning bot (M15)
+
+`BtcAdaptiveTrendEA.mq5` is the first BtcAdaptiveEA (moving-average crossover
+only, 648 settings) with the re-init fix. By default it considers **M15
+only** and uses magic **20260930**, so it can run next to BtcAdaptiveEA 2.x,
+for example:
+
+| Chart | Bot | Timeframe inputs | Magic |
+|---|---|---|---|
+| BTCUSDm (any) | BtcAdaptiveEA 2.x (multi-strategy) | M1 and/or M5 on, **M15 off** | 20260929 |
+| BTCUSDm (any) | BtcAdaptiveTrendEA | **M15 only** | 20260930 |
+
+The bot chooses its timeframe from its inputs; the chart's timeframe doesn't
+matter. Always give bots on the same symbol **different magic numbers**.
+Both bots trade the same account, so their risk adds up.
