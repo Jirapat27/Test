@@ -17,7 +17,7 @@
 //|  profits. There is NO daily loss limit in this bot.              |
 //+------------------------------------------------------------------+
 #property copyright "thaitrader"
-#property version   "2.00"
+#property version   "2.01"
 #property description "BTC-only bot that re-tunes itself across TREND, MEAN-REVERSION and BREAKOUT strategies"
 #property description "on recent data (incl. spread), validates on unseen data, pauses when nothing works."
 #property description "Per-trade stop loss and % risk sizing. No daily loss limit. Demo-only unless allowed."
@@ -545,7 +545,9 @@ bool Retune()
          switchIt = true;
    }
 
-   if(switchIt && !SameConfig(s_best, cur))
+   // !haveConfig: always adopt -- MT5 keeps globals (incl. cur) across re-inits,
+   // so the best setting can equal a stale cur while nothing is active yet.
+   if(switchIt && (!haveConfig || !SameConfig(s_best, cur)))
    {
       string prevText = haveConfig ? ConfigText(cur) : "none";
       cur = s_best;
@@ -712,7 +714,7 @@ void ShowStatus()
    string setting = haveConfig ? ConfigText(cur) : "none yet";
    string state   = !haveConfig ? (paused ? "PAUSED (no edge after costs)" : "waiting for first tune")
                                 : (paused ? "PAUSED (no edge after costs)" : "running");
-   Comment(StringFormat("BtcAdaptiveEA 2.0  %s  %s\nSetting: %s\nLast re-tune: %s (%s)\nTuning %+.1fR %d tr PF %.2f | Validation %+.1fR %d tr PF %.2f | min PF %.2f\nNext re-tune: %s\nBalance %.2f  Equity %.2f  Long %d  Short %d",
+   Comment(StringFormat("BtcAdaptiveEA 2.01  %s  %s\nSetting: %s\nLast re-tune: %s (%s)\nTuning %+.1fR %d tr PF %.2f | Validation %+.1fR %d tr PF %.2f | min PF %.2f\nNext re-tune: %s\nBalance %.2f  Equity %.2f  Long %d  Short %d",
                         _Symbol, state, setting,
                         lastRetune > 0 ? TimeToString(lastRetune, TIME_DATE | TIME_MINUTES) : "-", lastRetuneNote,
                         curIS.totalR, curIS.trades, ProfitFactor(curIS),
@@ -761,8 +763,13 @@ int OnInit()
    trade.SetDeviationInPoints(50);
    trade.SetTypeFillingBySymbol(_Symbol);
 
+   // Globals survive re-inits (timeframe or input changes), so reset all state explicitly.
+   ZeroMemory(cur);
    ResetResult(curIS);
    ResetResult(curOOS);
+   lastBarTime    = 0;
+   lastRetune     = 0;
+   lastRetuneNote = "not tuned yet";
    haveConfig = false;
    paused     = false;
    nextRetune = 0; // first tune on the first tick, once history is available
