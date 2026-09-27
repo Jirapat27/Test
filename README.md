@@ -79,6 +79,13 @@ thaitrader backtest --yf PTT.BK --period 5y --fast 10 --slow 30
 cancels working orders and stops placing new ones until you delete the file.
 It also creates this file itself when the daily loss limit is hit.
 
+## MetaTrader 5 (forex/CFD demo)
+
+To run a bot on MetaTrader 5 instead (for example an Exness demo account), see
+[`mt5/`](mt5/README.md). It contains a ready-to-compile MQL5 Expert Advisor
+with the same risk ideas: position sizing by % risk, a daily loss limit, and a
+refusal to trade on a real account unless you explicitly allow it.
+
 ## Writing your own strategy
 
 ```python
