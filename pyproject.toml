@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thaitrader"
+version = "0.1.0"
+description = "Auto-trading framework for the Thai stock market (SET/mai) via Settrade Open API"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "tzdata; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+settrade = ["settrade-v2>=2.2"]
+yf = ["yfinance>=0.2"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+thaitrader = "thaitrader.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
