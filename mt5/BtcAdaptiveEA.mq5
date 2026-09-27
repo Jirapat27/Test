@@ -314,6 +314,8 @@ bool Retune()
                   tested++;
 
                   SimResult rIs, rOos;
+                  ZeroMemory(rIs);
+                  ZeroMemory(rOos);
                   Simulate(c, 0, split, spread, rIs);
                   bool isCurrent = haveConfig && SameConfig(c, cur);
                   if(isCurrent)
